@@ -1,0 +1,18 @@
+{
+  "name": "n8n-outbound-dns-dmarc-rua-xml-report-parser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "n8n workflow that parses DMARC aggregate (rua) XML reports from IMAP, scores SPF/DKIM alignment per sending IP and detects spoofing. Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.",
+  "license": "MIT",
+  "author": "dhRobin Systems",
+  "scripts": {
+    "test": "node scripts/validate-workflow.js",
+    "validate": "node scripts/validate-workflow.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "xml2js": "^0.6.2"
+  }
+}

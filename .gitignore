@@ -1,0 +1,57 @@
+# n8n-outbound-dns-dmarc-rua-xml-report-parser :: git exclusions
+# Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.
+
+# --- Secrets & local environment ---------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# --- n8n local data (SQLite DB, encryption key, binary data, logs) -----------------
+.n8n/
+n8n-data/
+database.sqlite
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+binaryData/
+n8n*.log
+
+# --- DMARC report cache / real downloaded reports (may contain IPs & addresses) -----
+xml-cache/
+reports/
+tmp/
+temp/
+*.xml.gz
+*.zip
+*.gz
+# Real XML reports stay local; only the synthetic fixture is tracked.
+*.xml
+!sample-payloads/dmarc-rua-sample.xml
+
+# --- Sandbox / local outputs --------------------------------------------------------
+sandbox-output/
+output/
+outputs/
+exports/
+*.local.json
+workflow.*.backup.json
+
+# --- Node tooling -------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# --- OS / editor --------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

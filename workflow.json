@@ -1,0 +1,799 @@
+{
+  "name": "DMARC RUA XML Report Parser (n8n-outbound-dns-dmarc-rua-xml-report-parser)",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "read",
+        "format": "simple",
+        "downloadAttachments": true,
+        "options": {
+          "customEmailConfig": "[\"UNSEEN\"]",
+          "dataPropertyAttachmentsPrefixName": "attachment_",
+          "forceReconnect": 60
+        }
+      },
+      "id": "4cf3086d-c469-4939-af15-cdc41db4c8b4",
+      "name": "IMAP: DMARC RUA Inbox",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "imap": {
+          "id": "REPLACE_WITH_YOUR_IMAP_CREDENTIAL_ID",
+          "name": "IMAP - DMARC RUA Inbox"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Split Report Attachments\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Fans each IMAP email out into one item per DMARC-looking attachment (.zip, .gz or raw .xml)\n// and renames the binary key to `report`, so every downstream node is attachment-agnostic.\n// Emails without a DMARC-looking attachment produce no items and stop here.\n\nconst items = $input.all();\nconst out = [];\n\nfunction classify(fileName, mimeType) {\n  const name = String(fileName || '').toLowerCase();\n  const mime = String(mimeType || '').toLowerCase();\n  if (name.endsWith('.gz') || name.endsWith('.gzip') || mime.includes('gzip')) return 'gz';\n  if (name.endsWith('.zip') || mime.includes('zip')) return 'zip';\n  if (name.endsWith('.xml') || mime.includes('xml')) return 'xml';\n  return null;\n}\n\nfunction fromAddress(from) {\n  if (!from) return null;\n  if (typeof from === 'string') return from;\n  if (from.text) return from.text;\n  if (Array.isArray(from.value) && from.value[0]) return from.value[0].address || null;\n  return null;\n}\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const email = item.json || {};\n  const binaries = item.binary || {};\n\n  for (const [key, bin] of Object.entries(binaries)) {\n    const kind = classify(bin.fileName, bin.mimeType);\n    if (!kind) continue;\n\n    out.push({\n      json: {\n        kind,\n        source: 'imap',\n        file_name: bin.fileName || key,\n        mime_type: bin.mimeType || null,\n        email_subject: email.subject || null,\n        email_from: fromAddress(email.from),\n        email_date: email.date || null,\n        message_id: email.messageId || email['message-id'] || null,\n      },\n      // fileExtension is forced so the Compression node reliably picks zip vs gzip.\n      binary: { report: { ...bin, fileExtension: kind } },\n      pairedItem: { item: i },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "e983fe26-1867-48e1-a617-4554be7b4e78",
+      "name": "Split Report Attachments",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "0abe2865-384f-4eb0-a52d-af16d39182b0",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "xml",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a123dd99-0192-4475-afa5-54568eb3d9fb",
+      "name": "Compressed Attachment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "decompress",
+        "binaryPropertyName": "report",
+        "outputPrefix": "xml_"
+      },
+      "id": "0143e7fe-6b0f-40b0-a623-d93e2ab80c13",
+      "name": "Decompress (zip / gzip)",
+      "type": "n8n-nodes-base.compression",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        -120
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Extract & Validate XML\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Reads every binary on each item (raw `report` or decompressed `xml_*`), converts it to UTF-8 text\n// and applies safety gates before parsing:\n//   - size cap (MAX_XML_BYTES), protects the instance from oversized or zip-bomb payloads\n//   - DOCTYPE / ENTITY rejection, no legitimate DMARC report needs them (blocks XXE / entity expansion)\n//   - must contain a <feedback> root, otherwise it is not an aggregate report\n// Items that fail a gate are emitted with ok=false and routed to the parse-failure branch.\n\nfunction env(name, fallback) {\n  try {\n    const v = $env[name];\n    return v === undefined || v === null || v === '' ? fallback : String(v);\n  } catch (e) {\n    return fallback;\n  }\n}\n\nconst MAX_XML_BYTES = Number(env('MAX_XML_BYTES', '26214400')) || 26214400;\nconst items = $input.all();\nconst out = [];\n\nfunction fail(meta, i, reason, detail, fileName) {\n  return {\n    json: { ...meta, file_name: fileName || meta.file_name || null, ok: false, reason, error_message: detail || null },\n    pairedItem: { item: i },\n  };\n}\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const meta = { ...(item.json || {}) };\n  delete meta.kind;\n  const keys = Object.keys(item.binary || {});\n\n  if (!keys.length) {\n    out.push(fail(meta, i, 'no_binary_after_decompression', 'Archive was empty or contained no readable file'));\n    continue;\n  }\n\n  for (const key of keys) {\n    const bin = item.binary[key];\n    const fileName = (bin && bin.fileName) || meta.file_name || key;\n\n    let buf;\n    try {\n      buf = await this.helpers.getBinaryDataBuffer(i, key);\n    } catch (e) {\n      out.push(fail(meta, i, 'binary_read_error', e.message, fileName));\n      continue;\n    }\n\n    if (buf.length > MAX_XML_BYTES) {\n      out.push(fail(meta, i, 'xml_too_large', `${buf.length} bytes exceeds MAX_XML_BYTES=${MAX_XML_BYTES}`, fileName));\n      continue;\n    }\n\n    const xml = buf.toString('utf8').replace(/^﻿/, '').trim();\n\n    if (/<!DOCTYPE|<!ENTITY/i.test(xml)) {\n      out.push(fail(meta, i, 'doctype_or_entity_rejected', 'DOCTYPE/ENTITY declarations are not allowed in DMARC reports', fileName));\n      continue;\n    }\n    if (!/<feedback[\\s>]/i.test(xml)) {\n      out.push(fail(meta, i, 'not_a_dmarc_aggregate_report', 'No <feedback> root element found', fileName));\n      continue;\n    }\n\n    out.push({\n      json: { ...meta, file_name: fileName, ok: true, xml, xml_bytes: buf.length },\n      pairedItem: { item: i },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "8184457b-a9a6-41d4-ac39-5d9b5fe6a7d2",
+      "name": "Extract & Validate XML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "776ba6fb-a6a8-46cc-a2f9-6e96b73132e0",
+      "name": "Manual Trigger: Sandbox Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        720,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Load Synthetic Sample Report\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// SANDBOX entry point. Emits the synthetic fixture from sample-payloads/dmarc-rua-sample.xml\n// (identical copy, kept in sync by scripts/validate-workflow.js) plus one deliberately truncated\n// report that exercises the parse-failure branch. Contains no real data.\n\nconst INCLUDE_MALFORMED_FIXTURE = true;\n\nconst SAMPLE_XML = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--\n  n8n-outbound-dns-dmarc-rua-xml-report-parser :: synthetic DMARC aggregate (rua) report fixture\n  Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n\n  100% SYNTHETIC. Every domain uses the reserved example.com / example.net / example.org names (RFC 2606),\n  and every IP address sits in a documentation range (RFC 5737: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24;\n  RFC 3849: 2001:db8::/32). No real reporter, sender, recipient or infrastructure is represented.\n\n  Scenario covered (with AUTHORIZED_SENDER_IPS=192.0.2.0/27,192.0.2.40,2001:db8:10::/48, SPOOF_MIN_MESSAGES=5):\n    192.0.2.10      authorized_aligned          primary outbound MTA, DKIM + SPF aligned\n    192.0.2.25      authorized_aligned          ESP: DKIM aligned, SPF aligned to ESP bounce domain only (still DMARC pass)\n    2001:db8:10::5  authorized_aligned          IPv6 MTA matched by CIDR\n    192.0.2.40      authorized_misaligned       authorized app server with broken DKIM and SPF (warning)\n    203.0.113.50    unlisted_aligned_sender     passes DMARC but is not on the allowlist (info: review / add)\n    198.51.100.150  probable_forwarder          DMARC fail, reporter supplied override reason \"forwarded\"\n    203.0.113.200   unauthorized_low_volume     DMARC fail, below SPOOF_MIN_MESSAGES (warning)\n    198.51.100.77   unauthorized_spoofing       DMARC fail, unlisted, 45 messages (critical, triggers alert)\n-->\n<feedback>\n  <version>1.0</version>\n  <report_metadata>\n    <org_name>Example Mailbox Provider</org_name>\n    <email>noreply-dmarc-support@example.org</email>\n    <extra_contact_info>https://postmaster.example.org/dmarc</extra_contact_info>\n    <report_id>synthetic-rua-20261116-0001</report_id>\n    <date_range>\n      <begin>1794787200</begin>\n      <end>1794873599</end>\n    </date_range>\n  </report_metadata>\n  <policy_published>\n    <domain>example.com</domain>\n    <adkim>r</adkim>\n    <aspf>r</aspf>\n    <p>none</p>\n    <sp>none</sp>\n    <pct>100</pct>\n    <fo>1</fo>\n  </policy_published>\n\n  <record>\n    <row>\n      <source_ip>192.0.2.10</source_ip>\n      <count>1200</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>pass</dkim>\n        <spf>pass</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>example.com</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>s2026</selector>\n        <result>pass</result>\n      </dkim>\n      <spf>\n        <domain>example.com</domain>\n        <scope>mfrom</scope>\n        <result>pass</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>192.0.2.25</source_ip>\n      <count>340</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>pass</dkim>\n        <spf>fail</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>bounces.esp.example.net</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>esp1</selector>\n        <result>pass</result>\n      </dkim>\n      <dkim>\n        <domain>esp.example.net</domain>\n        <selector>shared</selector>\n        <result>pass</result>\n      </dkim>\n      <spf>\n        <domain>bounces.esp.example.net</domain>\n        <scope>mfrom</scope>\n        <result>pass</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>2001:db8:10::5</source_ip>\n      <count>85</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>pass</dkim>\n        <spf>pass</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>example.com</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>s2026</selector>\n        <result>pass</result>\n      </dkim>\n      <spf>\n        <domain>example.com</domain>\n        <scope>mfrom</scope>\n        <result>pass</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>192.0.2.40</source_ip>\n      <count>20</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>fail</dkim>\n        <spf>fail</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>app.example.com</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>legacy</selector>\n        <result>fail</result>\n      </dkim>\n      <spf>\n        <domain>app.example.com</domain>\n        <scope>mfrom</scope>\n        <result>softfail</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>203.0.113.50</source_ip>\n      <count>60</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>pass</dkim>\n        <spf>fail</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>mail.crm.example.net</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>crm1</selector>\n        <result>pass</result>\n      </dkim>\n      <spf>\n        <domain>mail.crm.example.net</domain>\n        <scope>mfrom</scope>\n        <result>pass</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>198.51.100.150</source_ip>\n      <count>12</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>fail</dkim>\n        <spf>fail</spf>\n        <reason>\n          <type>forwarded</type>\n          <comment>synthetic: message relayed by a mailing list host</comment>\n        </reason>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>lists.example.net</envelope_from>\n    </identifiers>\n    <auth_results>\n      <dkim>\n        <domain>example.com</domain>\n        <selector>s2026</selector>\n        <result>fail</result>\n      </dkim>\n      <spf>\n        <domain>lists.example.net</domain>\n        <scope>mfrom</scope>\n        <result>pass</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>203.0.113.200</source_ip>\n      <count>3</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>fail</dkim>\n        <spf>fail</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>unknown-host.example.net</envelope_from>\n    </identifiers>\n    <auth_results>\n      <spf>\n        <domain>unknown-host.example.net</domain>\n        <scope>mfrom</scope>\n        <result>none</result>\n      </spf>\n    </auth_results>\n  </record>\n\n  <record>\n    <row>\n      <source_ip>198.51.100.77</source_ip>\n      <count>45</count>\n      <policy_evaluated>\n        <disposition>none</disposition>\n        <dkim>fail</dkim>\n        <spf>fail</spf>\n      </policy_evaluated>\n    </row>\n    <identifiers>\n      <header_from>example.com</header_from>\n      <envelope_from>spoof-relay.example.net</envelope_from>\n    </identifiers>\n    <auth_results>\n      <spf>\n        <domain>spoof-relay.example.net</domain>\n        <scope>mfrom</scope>\n        <result>fail</result>\n      </spf>\n    </auth_results>\n  </record>\n</feedback>\n`;\n\nconst out = [\n  {\n    json: {\n      ok: true,\n      source: 'sandbox',\n      file_name: 'sample-payloads/dmarc-rua-sample.xml',\n      email_subject: 'Report Domain: example.com Submitter: example.org Report-ID: synthetic-rua-20261116-0001',\n      email_from: 'noreply-dmarc-support@example.org',\n      message_id: '<synthetic-0001@example.org>',\n      xml: SAMPLE_XML.trim(),\n      xml_bytes: SAMPLE_XML.length,\n    },\n  },\n];\n\nif (INCLUDE_MALFORMED_FIXTURE) {\n  out.push({\n    json: {\n      ok: true,\n      source: 'sandbox',\n      file_name: 'sandbox-malformed-fixture.xml',\n      email_subject: 'Report Domain: example.com Submitter: example.net Report-ID: synthetic-truncated',\n      email_from: 'dmarc@example.net',\n      message_id: '<synthetic-0002@example.net>',\n      xml: '<?xml version=\"1.0\"?><feedback><report_metadata><org_name>Truncated Example</org_name>',\n      xml_bytes: 84,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "800a3938-9a4e-45eb-aa29-228897f98fce",
+      "name": "Load Synthetic Sample Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "1213f98e-7c7b-4628-a250-b8d4d67dd96c",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c136920f-789a-4a2d-a23b-b9bfb5889250",
+      "name": "XML Extracted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "xmlToJson",
+        "dataPropertyName": "xml",
+        "options": {
+          "explicitArray": false,
+          "explicitRoot": true,
+          "ignoreAttrs": true,
+          "mergeAttrs": true,
+          "normalize": false,
+          "normalizeTags": false,
+          "trim": true
+        }
+      },
+      "id": "2dc6ffd1-a903-48f1-ac90-aa8b0cb8bcfd",
+      "name": "Parse DMARC XML",
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        0
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Compute Alignment & Detect Spoofing\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Input : one item per parsed DMARC aggregate report (output of the XML node, explicitArray=false).\n// Output: one `dmarc_report` event per report with per-IP SPF/DKIM alignment rates, sender\n//         classification, spoofing sources, a health score and alert decision. Structurally broken\n//         reports become `parse_failure` events instead.\n//\n// Alignment verdicts come from the reporter's <policy_evaluated> block (the receiver's own DMARC\n// evaluation). Raw <auth_results> are reported alongside so you can see \"authenticated but not aligned\" gaps.\n\nconst SCHEMA_VERSION = '1.0';\n\nfunction env(name, fallback) {\n  try {\n    const v = $env[name];\n    return v === undefined || v === null || v === '' ? fallback : String(v);\n  } catch (e) {\n    return fallback;\n  }\n}\nconst list = (s) => String(s || '').split(/[\\s,;]+/).map((x) => x.trim()).filter(Boolean);\nconst num = (s, d) => (Number.isFinite(Number(s)) ? Number(s) : d);\nconst bool = (s, d) => (s === undefined || s === null || s === '' ? d : ['1', 'true', 'yes', 'on'].includes(String(s).toLowerCase()));\nconst toArray = (v) => (v === undefined || v === null || v === '' ? [] : Array.isArray(v) ? v : [v]);\nconst txt = (v) => {\n  if (v === undefined || v === null) return '';\n  if (typeof v === 'object') return v._ !== undefined ? String(v._).trim() : '';\n  return String(v).trim();\n};\nconst pct = (n, d) => (d > 0 ? Math.round((n / d) * 10000) / 100 : null);\nconst lowerDomain = (d) => txt(d).toLowerCase().replace(/\\.$/, '');\n\n// ---------- IP / CIDR matching (IPv4 + IPv6, BigInt based) ----------\nfunction parseIPv4(ip) {\n  const parts = ip.split('.');\n  if (parts.length !== 4) return null;\n  let n = 0n;\n  for (const p of parts) {\n    if (!/^\\d{1,3}$/.test(p) || Number(p) > 255) return null;\n    n = (n << 8n) + BigInt(Number(p));\n  }\n  return { v: n, bits: 32 };\n}\nfunction parseIPv6(ip) {\n  ip = ip.split('%')[0].toLowerCase();\n  const embedded = ip.match(/^(.*:)(\\d{1,3}(?:\\.\\d{1,3}){3})$/);\n  if (embedded) {\n    const v4 = parseIPv4(embedded[2]);\n    if (!v4) return null;\n    ip = embedded[1] + ((v4.v >> 16n) & 0xffffn).toString(16) + ':' + (v4.v & 0xffffn).toString(16);\n  }\n  const halves = ip.split('::');\n  if (halves.length > 2) return null;\n  const groupsOf = (s) => (s === '' ? [] : s.split(':'));\n  let groups;\n  if (halves.length === 2) {\n    const left = groupsOf(halves[0]);\n    const right = groupsOf(halves[1]);\n    const fill = 8 - left.length - right.length;\n    if (fill < 1) return null;\n    groups = [...left, ...Array(fill).fill('0'), ...right];\n  } else {\n    groups = groupsOf(halves[0]);\n  }\n  if (groups.length !== 8) return null;\n  let n = 0n;\n  for (const g of groups) {\n    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;\n    n = (n << 16n) + BigInt(parseInt(g, 16));\n  }\n  return { v: n, bits: 128 };\n}\nfunction parseIP(ip) {\n  ip = String(ip || '').trim();\n  if (!ip) return null;\n  const parsed = ip.includes(':') ? parseIPv6(ip) : parseIPv4(ip);\n  // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4.\n  if (parsed && parsed.bits === 128 && parsed.v >> 32n === 0xffffn) return { v: parsed.v & 0xffffffffn, bits: 32 };\n  return parsed;\n}\nfunction parseCidr(entry) {\n  const [base, len] = entry.split('/');\n  const ip = parseIP(base);\n  if (!ip) return null;\n  const prefix = len === undefined ? ip.bits : Number(len);\n  if (!Number.isInteger(prefix) || prefix < 0 || prefix > ip.bits) return null;\n  const shift = BigInt(ip.bits - prefix);\n  return { entry, bits: ip.bits, shift, net: ip.v >> shift };\n}\n\n// ---------- Configuration ----------\nconst configWarnings = [];\nconst CFG = {\n  sandbox: bool(env('SANDBOX_MODE', 'true'), true),\n  watchlist: list(env('DOMAIN_WATCHLIST', '')).map(lowerDomain),\n  spoofMin: Math.max(1, num(env('SPOOF_MIN_MESSAGES', '5'), 5)),\n  warn: num(env('HEALTH_WARN_THRESHOLD', '98'), 98),\n  crit: num(env('HEALTH_CRITICAL_THRESHOLD', '90'), 90),\n  alertOnSpoofing: bool(env('ALERT_ON_SPOOFING', 'true'), true),\n  alertOnWarning: bool(env('ALERT_ON_WARNING', 'false'), false),\n  alertOnParseFailure: bool(env('ALERT_ON_PARSE_FAILURE', 'true'), true),\n  allowlist: [],\n};\nfor (const entry of list(env('AUTHORIZED_SENDER_IPS', ''))) {\n  const c = parseCidr(entry);\n  if (c) CFG.allowlist.push(c);\n  else configWarnings.push(`Ignored invalid AUTHORIZED_SENDER_IPS entry: ${entry}`);\n}\nif (CFG.crit > CFG.warn) configWarnings.push('HEALTH_CRITICAL_THRESHOLD is above HEALTH_WARN_THRESHOLD; check thresholds');\n\nfunction ipAuthorized(ip) {\n  if (!CFG.allowlist.length) return null; // unknown: no allowlist configured\n  const p = parseIP(ip);\n  if (!p) return false;\n  return CFG.allowlist.some((c) => c.bits === p.bits && p.v >> c.shift === c.net);\n}\n\nconst FORWARDING_REASONS = new Set(['forwarded', 'mailing_list', 'trusted_forwarder']);\nconst EXCLUDED_FROM_HEALTH = new Set(['unauthorized_spoofing', 'unauthorized_low_volume', 'probable_forwarder']);\nconst SEVERITY = {\n  authorized_aligned: 'ok',\n  aligned_sender: 'ok',\n  unlisted_aligned_sender: 'info',\n  probable_forwarder: 'info',\n  authorized_misaligned: 'warning',\n  unlisted_partially_aligned: 'warning',\n  unauthorized_low_volume: 'warning',\n  unauthorized_spoofing: 'critical',\n};\n\nfunction toIso(epoch) {\n  const n = Number(epoch);\n  return Number.isFinite(n) && n > 0 ? new Date(n * 1000).toISOString() : null;\n}\n\nfunction upstreamMeta(i) {\n  try {\n    const m = $('XML Extracted?').itemMatching(i);\n    const x = (m && m.json) || {};\n    return {\n      source: x.source || null,\n      file_name: x.file_name || null,\n      email_subject: x.email_subject || null,\n      email_from: x.email_from || null,\n      message_id: x.message_id || null,\n    };\n  } catch (e) {\n    return { source: null, file_name: null, email_subject: null, email_from: null, message_id: null };\n  }\n}\n\nfunction parseFailureEvent(meta, reason, detail, processedAt) {\n  const alert = CFG.alertOnParseFailure;\n  return {\n    event_type: 'parse_failure',\n    schema_version: SCHEMA_VERSION,\n    report_key: `parse_failure|${meta.file_name || 'unknown'}|${processedAt}`,\n    sandbox_mode: CFG.sandbox,\n    processed_at: processedAt,\n    ...meta,\n    reason,\n    error_message: detail || null,\n    health: { status: 'unknown' },\n    alert_required: alert,\n    alert_reasons: alert ? [`Report could not be parsed: ${reason}`] : [],\n    dashboard_row: {\n      report_key: `parse_failure|${meta.file_name || 'unknown'}|${processedAt}`,\n      event_type: 'parse_failure',\n      file_name: meta.file_name || null,\n      reason,\n      health_status: 'unknown',\n      alert_required: alert,\n      processed_at: processedAt,\n    },\n  };\n}\n\nfunction newAgg(ip) {\n  return {\n    source_ip: ip,\n    messages: 0,\n    dkim_aligned_pass: 0,\n    spf_aligned_pass: 0,\n    dmarc_pass: 0,\n    dmarc_fail: 0,\n    forwarding_fail: 0,\n    dkim_auth_pass: 0,\n    spf_auth_pass: 0,\n    dispositions: {},\n    header_from: new Set(),\n    envelope_from: new Set(),\n    dkim_domains: new Set(),\n    spf_domains: new Set(),\n    override_reasons: new Set(),\n  };\n}\n\n// ---------- Main ----------\nconst items = $input.all();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const processedAt = new Date().toISOString();\n  const j = items[i].json || {};\n  const meta = upstreamMeta(i);\n  const fb = j.feedback || (j.report_metadata ? j : null);\n\n  if (!fb || typeof fb !== 'object' || !fb.report_metadata || !fb.policy_published) {\n    out.push({ json: parseFailureEvent(meta, 'missing_required_dmarc_sections', 'report_metadata or policy_published not found', processedAt), pairedItem: { item: i } });\n    continue;\n  }\n\n  const rm = fb.report_metadata;\n  const pp = fb.policy_published;\n  const orgName = txt(rm.org_name) || 'unknown_reporter';\n  const reportId = txt(rm.report_id) || `no_id_${processedAt}`;\n  const domain = lowerDomain(pp.domain);\n  const pctRaw = txt(pp.pct);\n  const policy = {\n    p: txt(pp.p).toLowerCase() || null,\n    sp: txt(pp.sp).toLowerCase() || null,\n    np: txt(pp.np).toLowerCase() || null,\n    pct: pctRaw === '' ? 100 : num(pctRaw, 100),\n    adkim: txt(pp.adkim).toLowerCase() || 'r',\n    aspf: txt(pp.aspf).toLowerCase() || 'r',\n    fo: txt(pp.fo) || null,\n  };\n\n  const byIp = new Map();\n  let malformedRecords = 0;\n\n  for (const rec of toArray(fb.record)) {\n    const row = (rec && rec.row) || {};\n    const pe = row.policy_evaluated || {};\n    const ip = txt(row.source_ip);\n    if (!ip || !parseIP(ip)) {\n      malformedRecords++;\n      continue;\n    }\n    const count = Math.max(0, parseInt(txt(row.count), 10) || 0);\n    const dkimAligned = txt(pe.dkim).toLowerCase() === 'pass';\n    const spfAligned = txt(pe.spf).toLowerCase() === 'pass';\n    const dmarcPass = dkimAligned || spfAligned;\n    const disposition = txt(pe.disposition).toLowerCase() || 'none';\n    const reasons = toArray(pe.reason).map((r) => txt(r && r.type).toLowerCase()).filter(Boolean);\n    const ids = rec.identifiers || {};\n    const ar = rec.auth_results || {};\n    const dkimResults = toArray(ar.dkim);\n    const spfResults = toArray(ar.spf);\n\n    const agg = byIp.get(ip) || newAgg(ip);\n    agg.messages += count;\n    if (dkimAligned) agg.dkim_aligned_pass += count;\n    if (spfAligned) agg.spf_aligned_pass += count;\n    if (dmarcPass) agg.dmarc_pass += count;\n    else {\n      agg.dmarc_fail += count;\n      if (reasons.some((r) => FORWARDING_REASONS.has(r))) agg.forwarding_fail += count;\n    }\n    if (dkimResults.some((d) => txt(d && d.result).toLowerCase() === 'pass')) agg.dkim_auth_pass += count;\n    if (spfResults.some((s) => txt(s && s.result).toLowerCase() === 'pass')) agg.spf_auth_pass += count;\n    agg.dispositions[disposition] = (agg.dispositions[disposition] || 0) + count;\n\n    const hf = lowerDomain(ids.header_from);\n    const ef = lowerDomain(ids.envelope_from);\n    if (hf) agg.header_from.add(hf);\n    if (ef) agg.envelope_from.add(ef);\n    for (const d of dkimResults) {\n      const dd = lowerDomain(d && d.domain);\n      if (dd) agg.dkim_domains.add(`${dd}${txt(d.selector) ? ` (s=${txt(d.selector)})` : ''}: ${txt(d.result).toLowerCase() || 'unknown'}`);\n    }\n    for (const s of spfResults) {\n      const sd = lowerDomain(s && s.domain);\n      if (sd) agg.spf_domains.add(`${sd}: ${txt(s.result).toLowerCase() || 'unknown'}`);\n    }\n    for (const r of reasons) agg.override_reasons.add(r);\n    byIp.set(ip, agg);\n  }\n\n  // ---------- Classification ----------\n  const perIp = [];\n  const classificationCounts = {};\n  const totals = { messages: 0, unique_ips: 0, dkim_aligned_pass: 0, spf_aligned_pass: 0, dmarc_pass: 0, dmarc_fail: 0, dkim_auth_pass: 0, spf_auth_pass: 0, dispositions: {} };\n  let legitMessages = 0;\n  let legitPass = 0;\n\n  for (const agg of byIp.values()) {\n    if (agg.messages === 0) continue;\n    const authorized = ipAuthorized(agg.source_ip);\n    let classification;\n    if (agg.dmarc_fail === 0) classification = authorized === false ? 'unlisted_aligned_sender' : authorized === true ? 'authorized_aligned' : 'aligned_sender';\n    else if (authorized === true) classification = 'authorized_misaligned';\n    else if (agg.forwarding_fail === agg.dmarc_fail) classification = 'probable_forwarder';\n    else if (agg.dmarc_pass > 0) classification = 'unlisted_partially_aligned';\n    else if (agg.dmarc_fail - agg.forwarding_fail >= CFG.spoofMin) classification = 'unauthorized_spoofing';\n    else classification = 'unauthorized_low_volume';\n\n    classificationCounts[classification] = (classificationCounts[classification] || 0) + 1;\n    if (!EXCLUDED_FROM_HEALTH.has(classification)) {\n      legitMessages += agg.messages;\n      legitPass += agg.dmarc_pass;\n    }\n\n    totals.messages += agg.messages;\n    totals.unique_ips += 1;\n    for (const k of ['dkim_aligned_pass', 'spf_aligned_pass', 'dmarc_pass', 'dmarc_fail', 'dkim_auth_pass', 'spf_auth_pass']) totals[k] += agg[k];\n    for (const [d, c] of Object.entries(agg.dispositions)) totals.dispositions[d] = (totals.dispositions[d] || 0) + c;\n\n    perIp.push({\n      source_ip: agg.source_ip,\n      ip_version: agg.source_ip.includes(':') ? 6 : 4,\n      authorized,\n      classification,\n      severity: SEVERITY[classification],\n      messages: agg.messages,\n      dkim_aligned_pass: agg.dkim_aligned_pass,\n      spf_aligned_pass: agg.spf_aligned_pass,\n      dmarc_pass: agg.dmarc_pass,\n      dmarc_fail: agg.dmarc_fail,\n      dkim_aligned_rate: pct(agg.dkim_aligned_pass, agg.messages),\n      spf_aligned_rate: pct(agg.spf_aligned_pass, agg.messages),\n      dmarc_pass_rate: pct(agg.dmarc_pass, agg.messages),\n      dkim_auth_rate: pct(agg.dkim_auth_pass, agg.messages),\n      spf_auth_rate: pct(agg.spf_auth_pass, agg.messages),\n      dispositions: agg.dispositions,\n      header_from: [...agg.header_from],\n      envelope_from: [...agg.envelope_from],\n      dkim_results: [...agg.dkim_domains],\n      spf_results: [...agg.spf_domains],\n      override_reasons: [...agg.override_reasons],\n    });\n  }\n  perIp.sort((a, b) => b.messages - a.messages || a.source_ip.localeCompare(b.source_ip));\n\n  const spoofSources = perIp.filter((p) => p.classification === 'unauthorized_spoofing');\n  const spoofMessages = spoofSources.reduce((s, p) => s + p.messages, 0);\n  const ipsOf = (cls) => perIp.filter((p) => p.classification === cls).map((p) => p.source_ip);\n\n  // ---------- Health ----------\n  const healthScore = pct(legitPass, legitMessages);\n  let healthStatus;\n  if (legitMessages === 0) healthStatus = 'no_legitimate_traffic';\n  else if (healthScore >= CFG.warn) healthStatus = 'healthy';\n  else if (healthScore >= CFG.crit) healthStatus = 'warning';\n  else healthStatus = 'critical';\n\n  // ---------- Recommendations ----------\n  const recommendations = [];\n  if (policy.p === 'none') recommendations.push('Policy is p=none (monitor only): spoofed mail is still delivered. Once all legitimate sources align, move to p=quarantine, then p=reject.');\n  if (policy.pct < 100) recommendations.push(`Policy applies to pct=${policy.pct}% of failing mail; raise to 100 once stable.`);\n  if (!CFG.allowlist.length) recommendations.push('AUTHORIZED_SENDER_IPS is empty: sender classification relies on DMARC results only. Configure your known sending IPs/CIDRs.');\n  if (ipsOf('authorized_misaligned').length) recommendations.push(`Fix DKIM signing and/or SPF alignment on authorized senders: ${ipsOf('authorized_misaligned').join(', ')}`);\n  if (ipsOf('unlisted_aligned_sender').length) recommendations.push(`These IPs pass DMARC but are not on your allowlist. Verify the vendor and add them if legitimate: ${ipsOf('unlisted_aligned_sender').join(', ')}`);\n  if (ipsOf('unlisted_partially_aligned').length) recommendations.push(`Investigate partially aligned, unlisted senders: ${ipsOf('unlisted_partially_aligned').join(', ')}`);\n  if (spoofSources.length && policy.p === 'none') recommendations.push('Spoofing detected while p=none: those messages were delivered. Prioritise enforcement.');\n\n  // ---------- Scope & alerting ----------\n  const inScope = !CFG.watchlist.length || CFG.watchlist.includes(domain);\n  const alertReasons = [];\n  if (inScope) {\n    if (spoofSources.length && CFG.alertOnSpoofing) alertReasons.push(`${spoofSources.length} unauthorized spoofing source(s), ${spoofMessages} message(s)`);\n    if (healthStatus === 'critical') alertReasons.push(`Health score ${healthScore}% is below critical threshold ${CFG.crit}%`);\n    if (healthStatus === 'warning' && CFG.alertOnWarning) alertReasons.push(`Health score ${healthScore}% is below warning threshold ${CFG.warn}%`);\n  }\n\n  const reportKey = `${orgName}|${reportId}`;\n  const dateRange = { begin: toIso(txt(rm.date_range && rm.date_range.begin)), end: toIso(txt(rm.date_range && rm.date_range.end)) };\n  const rates = {\n    dkim_aligned: pct(totals.dkim_aligned_pass, totals.messages),\n    spf_aligned: pct(totals.spf_aligned_pass, totals.messages),\n    dmarc_pass: pct(totals.dmarc_pass, totals.messages),\n    dkim_auth: pct(totals.dkim_auth_pass, totals.messages),\n    spf_auth: pct(totals.spf_auth_pass, totals.messages),\n  };\n\n  out.push({\n    json: {\n      event_type: 'dmarc_report',\n      schema_version: SCHEMA_VERSION,\n      report_key: reportKey,\n      in_scope: inScope,\n      sandbox_mode: CFG.sandbox,\n      processed_at: processedAt,\n      ...meta,\n      reporter: { org_name: orgName, email: txt(rm.email) || null, extra_contact_info: txt(rm.extra_contact_info) || null, report_id: reportId },\n      date_range: dateRange,\n      policy_domain: domain,\n      policy,\n      totals,\n      rates,\n      health: { score: healthScore, status: healthStatus, legitimate_messages: legitMessages, legitimate_dmarc_pass: legitPass, warn_threshold: CFG.warn, critical_threshold: CFG.crit },\n      spoofing: {\n        source_count: spoofSources.length,\n        message_count: spoofMessages,\n        sources: spoofSources.map((p) => ({ source_ip: p.source_ip, messages: p.messages, dispositions: p.dispositions, header_from: p.header_from, envelope_from: p.envelope_from, spf_results: p.spf_results, dkim_results: p.dkim_results })),\n      },\n      classification_counts: classificationCounts,\n      per_ip: perIp,\n      recommendations,\n      config_warnings: configWarnings,\n      malformed_records: malformedRecords,\n      alert_required: alertReasons.length > 0,\n      alert_reasons: alertReasons,\n      dashboard_row: {\n        report_key: reportKey,\n        event_type: 'dmarc_report',\n        policy_domain: domain,\n        in_scope: inScope,\n        reporter_org: orgName,\n        report_id: reportId,\n        date_begin: dateRange.begin,\n        date_end: dateRange.end,\n        messages: totals.messages,\n        unique_ips: totals.unique_ips,\n        dmarc_pass_rate: rates.dmarc_pass,\n        dkim_aligned_rate: rates.dkim_aligned,\n        spf_aligned_rate: rates.spf_aligned,\n        health_score: healthScore,\n        health_status: healthStatus,\n        spoofing_sources: spoofSources.length,\n        spoofing_messages: spoofMessages,\n        policy_p: policy.p,\n        policy_pct: policy.pct,\n        alert_required: alertReasons.length > 0,\n        processed_at: processedAt,\n      },\n    },\n    pairedItem: { item: i },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "589e4746-0280-4591-a928-091844007f06",
+      "name": "Compute Alignment & Detect Spoofing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Build Parse-Failure Event\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Collects every item that could not become a parsed report (decompression error, failed safety\n// gate, malformed XML) and turns it into a uniform `parse_failure` event, so failures are logged to\n// the dashboard and alerted instead of disappearing silently.\n\nconst SCHEMA_VERSION = '1.0';\n\nfunction env(name, fallback) {\n  try {\n    const v = $env[name];\n    return v === undefined || v === null || v === '' ? fallback : String(v);\n  } catch (e) {\n    return fallback;\n  }\n}\nconst bool = (s, d) => (s === undefined || s === null || s === '' ? d : ['1', 'true', 'yes', 'on'].includes(String(s).toLowerCase()));\n\nconst SANDBOX = bool(env('SANDBOX_MODE', 'true'), true);\nconst ALERT = bool(env('ALERT_ON_PARSE_FAILURE', 'true'), true);\n\nfunction errorText(e) {\n  if (!e) return null;\n  if (typeof e === 'string') return e;\n  return e.message || e.description || JSON.stringify(e).slice(0, 500);\n}\n\nconst out = [];\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const j = items[i].json || {};\n  const processedAt = new Date().toISOString();\n\n  let reason = j.reason;\n  if (!reason) reason = j.kind && j.kind !== 'xml' ? 'decompression_failed' : j.error ? 'xml_parse_error' : 'unknown_parse_failure';\n\n  const fileName = j.file_name || null;\n  const key = `parse_failure|${fileName || 'unknown'}|${processedAt}|${i}`;\n\n  out.push({\n    json: {\n      event_type: 'parse_failure',\n      schema_version: SCHEMA_VERSION,\n      report_key: key,\n      sandbox_mode: SANDBOX,\n      processed_at: processedAt,\n      source: j.source || null,\n      file_name: fileName,\n      email_subject: j.email_subject || null,\n      email_from: j.email_from || null,\n      message_id: j.message_id || null,\n      reason,\n      error_message: j.error_message || errorText(j.error),\n      health: { status: 'unknown' },\n      alert_required: ALERT,\n      alert_reasons: ALERT ? [`Report could not be parsed: ${reason}`] : [],\n      dashboard_row: {\n        report_key: key,\n        event_type: 'parse_failure',\n        file_name: fileName,\n        reason,\n        health_status: 'unknown',\n        alert_required: ALERT,\n        processed_at: processedAt,\n      },\n    },\n    pairedItem: { item: i },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "774b39eb-33e8-4eb6-aab1-3ee7735cfb43",
+      "name": "Build Parse-Failure Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "d562e0dd-886d-4b2e-a823-e45dde643d03",
+              "leftValue": "={{ $json.sandbox_mode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e26266b2-dea1-49dd-a075-ee23a4073130",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Sandbox Preview (No Delivery)\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// SANDBOX_MODE=true terminates here. Nothing is posted to the dashboard or alert webhooks; each item\n// shows what WOULD have been delivered so you can verify parsing, classification and alert logic.\n\nreturn $input.all().map((item, i) => {\n  const e = item.json || {};\n  let summary;\n  if (e.event_type === 'dmarc_report') {\n    summary = `${e.policy_domain} | ${e.reporter && e.reporter.org_name} | ${e.totals.messages} msgs | DMARC pass ${e.rates.dmarc_pass}% | health ${e.health.status} (${e.health.score}%) | spoofing sources ${e.spoofing.source_count}`;\n  } else {\n    summary = `${e.event_type}: ${e.reason || 'n/a'} (${e.file_name || 'unknown file'})`;\n  }\n  return {\n    json: {\n      sandbox_preview: true,\n      summary,\n      would_post_to_dashboard: true,\n      would_send_alert: !!e.alert_required,\n      alert_reasons: e.alert_reasons || [],\n      dashboard_payload: e,\n    },\n    pairedItem: { item: i },\n  };\n});\n"
+      },
+      "id": "6f6d802e-7278-4545-a5b8-110a304e2d81",
+      "name": "Sandbox Preview (No Delivery)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "removeItemsRepeatedWithinPreviousExecutions",
+        "logic": "removeItemsWithAlreadySeenKeyValues",
+        "dedupeValue": "={{ $json.report_key }}",
+        "options": {
+          "scope": "node",
+          "historySize": 10000
+        }
+      },
+      "id": "10ad6c93-3e07-46ad-a01a-389ba014a94e",
+      "name": "Skip Already-Processed Reports",
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DASHBOARD_WEBHOOK_URL }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Idempotency-Key",
+              "value": "={{ $json.report_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "441b954a-122e-4e8e-a54a-ac2f4b7d130b",
+      "name": "Log to Dashboard Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_HEADER_AUTH_CREDENTIAL_ID",
+          "name": "Dashboard Webhook Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Dashboard Delivery Failure\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Receives items from the dashboard HTTP node's error output (after its built-in retries are\n// exhausted) and converts them into `delivery_failure` alert events.\n\nconst items = $input.all();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const j = items[i].json || {};\n  let failedKey = null;\n  try {\n    const src = $('Skip Already-Processed Reports').itemMatching(i);\n    failedKey = (src && src.json && src.json.report_key) || null;\n  } catch (e) {\n    failedKey = j.report_key || null;\n  }\n  const err = j.error;\n  const message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'Unknown HTTP error';\n  const processedAt = new Date().toISOString();\n\n  out.push({\n    json: {\n      event_type: 'delivery_failure',\n      schema_version: '1.0',\n      report_key: `delivery_failure|${failedKey || 'unknown'}|${processedAt}`,\n      target: 'dashboard_webhook',\n      failed_report_key: failedKey,\n      error_message: String(message).slice(0, 1000),\n      sandbox_mode: false,\n      processed_at: processedAt,\n      alert_required: true,\n      alert_reasons: ['Dashboard webhook delivery failed after retries; the report was NOT logged'],\n    },\n    pairedItem: { item: i },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "98aa0772-26f2-4157-a4ae-e1bb034ab31a",
+      "name": "Dashboard Delivery Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "dc440f72-dd72-4a19-aa96-5f4083104716",
+              "leftValue": "={{ $json.alert_required }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "55a09260-7fd2-4c9d-a2ad-5581b2030d55",
+      "name": "Alert Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Format Alert Message\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Builds the alert webhook body.\n//   ALERT_PAYLOAD_FORMAT=slack   -> { text }                         (Slack / Mattermost / Rocket.Chat incoming webhooks)\n//   ALERT_PAYLOAD_FORMAT=generic -> { text, event_type, report_key, event }  (your own endpoint)\n\nfunction env(name, fallback) {\n  try {\n    const v = $env[name];\n    return v === undefined || v === null || v === '' ? fallback : String(v);\n  } catch (e) {\n    return fallback;\n  }\n}\n\nconst FORMAT = env('ALERT_PAYLOAD_FORMAT', 'slack').toLowerCase();\nconst MAX_SOURCES = Math.max(1, Number(env('MAX_SPOOF_SOURCES_IN_ALERT', '10')) || 10);\nconst esc = (s) => String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst n = (v) => (typeof v === 'number' ? v.toLocaleString('en-US') : 'n/a');\nconst p = (v) => (typeof v === 'number' ? `${v}%` : 'n/a');\nconst disp = (d) => Object.entries(d || {}).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a';\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const e = item.json || {};\n  const lines = [];\n\n  if (e.event_type === 'dmarc_report') {\n    lines.push(`[DMARC] ${String(e.health.status).toUpperCase()} | ${esc(e.policy_domain)} | report ${esc(e.reporter.report_id)} from ${esc(e.reporter.org_name)}`);\n    lines.push(`Window: ${e.date_range.begin} to ${e.date_range.end}`);\n    lines.push(`Messages: ${n(e.totals.messages)} | DMARC pass: ${p(e.rates.dmarc_pass)} | DKIM aligned: ${p(e.rates.dkim_aligned)} | SPF aligned: ${p(e.rates.spf_aligned)}`);\n    lines.push(`Legitimate-traffic health score: ${p(e.health.score)} (warning below ${e.health.warn_threshold}%, critical below ${e.health.critical_threshold}%)`);\n    if (e.spoofing.source_count > 0) {\n      lines.push(`Unauthorized spoofing sources: ${e.spoofing.source_count} IP(s), ${n(e.spoofing.message_count)} message(s)`);\n      for (const s of e.spoofing.sources.slice(0, MAX_SOURCES)) {\n        lines.push(`  - ${esc(s.source_ip)}: ${n(s.messages)} msgs, header_from ${esc(s.header_from.join('/'))}, disposition ${esc(disp(s.dispositions))}`);\n      }\n      if (e.spoofing.source_count > MAX_SOURCES) lines.push(`  ...and ${e.spoofing.source_count - MAX_SOURCES} more (see dashboard)`);\n    }\n    lines.push(`Published policy: p=${esc(e.policy.p)} sp=${esc(e.policy.sp || e.policy.p)} pct=${e.policy.pct} adkim=${esc(e.policy.adkim)} aspf=${esc(e.policy.aspf)}`);\n    lines.push(`Triggered by: ${esc(e.alert_reasons.join('; '))}`);\n    if (e.recommendations && e.recommendations.length) {\n      lines.push('Next steps:');\n      for (const r of e.recommendations.slice(0, 3)) lines.push(`  - ${esc(r)}`);\n    }\n  } else if (e.event_type === 'parse_failure') {\n    lines.push(`[DMARC] PARSE FAILURE | file ${esc(e.file_name || 'unknown')} | reason ${esc(e.reason)}`);\n    if (e.error_message) lines.push(`Error: ${esc(String(e.error_message).slice(0, 300))}`);\n    if (e.email_subject) lines.push(`Email subject: ${esc(e.email_subject)}`);\n    lines.push('The report was not processed. Inspect the n8n execution and the source email.');\n  } else if (e.event_type === 'delivery_failure') {\n    lines.push(`[DMARC] DELIVERY FAILURE | ${esc(e.target)} | report ${esc(e.failed_report_key || 'unknown')}`);\n    lines.push(`Error: ${esc(e.error_message)}`);\n    lines.push('The report was parsed but not logged. Re-run the execution once the dashboard endpoint is reachable.');\n  } else {\n    lines.push(`[DMARC] ${esc(e.event_type || 'event')}: ${esc(JSON.stringify(e).slice(0, 500))}`);\n  }\n\n  const text = lines.join('\\n');\n  out.push({ json: FORMAT === 'generic' ? { text, event_type: e.event_type, report_key: e.report_key, event: e } : { text } });\n}\n\nreturn out;\n"
+      },
+      "id": "f1a5d042-456f-4205-ac88-d47c08619744",
+      "name": "Format Alert Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "29d0467f-4448-4556-a7fc-06a907f4d539",
+      "name": "Send Alert Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        360
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {},
+      "id": "1ff4f19f-90d2-4ffa-ae0f-bbf1242f0241",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n-outbound-dns-dmarc-rua-xml-report-parser :: Format Workflow Error\n// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n//\n// Runs when n8n reports an unhandled failure (requires this workflow to be set as its own Error\n// Workflow in Settings). Suppressed in SANDBOX_MODE and when no alert URL is configured.\n\nfunction env(name, fallback) {\n  try {\n    const v = $env[name];\n    return v === undefined || v === null || v === '' ? fallback : String(v);\n  } catch (e) {\n    return fallback;\n  }\n}\nconst sandbox = ['1', 'true', 'yes', 'on'].includes(env('SANDBOX_MODE', 'true').toLowerCase());\nconst url = env('ERROR_ALERT_WEBHOOK_URL', '') || env('ALERT_WEBHOOK_URL', '');\nif (sandbox || !url) return [];\n\nconst format = env('ALERT_PAYLOAD_FORMAT', 'slack').toLowerCase();\nconst esc = (s) => String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nreturn $input.all().map((item) => {\n  const j = item.json || {};\n  const exec = j.execution || {};\n  const wf = j.workflow || {};\n  const err = exec.error || j.trigger?.error || {};\n  const text = [\n    `[DMARC] WORKFLOW ERROR | ${esc(wf.name || 'DMARC RUA parser')} | node: ${esc(exec.lastNodeExecuted || 'unknown')}`,\n    `Error: ${esc(String(err.message || 'unknown error').slice(0, 400))}`,\n    `Execution: ${esc(exec.url || exec.id || 'n/a')} (mode: ${esc(exec.mode || 'n/a')})`,\n  ].join('\\n');\n  return { json: { url, payload: format === 'generic' ? { text, event_type: 'workflow_error', workflow: wf.name || null, execution_id: exec.id || null } : { text } } };\n});\n"
+      },
+      "id": "c60dad49-e899-4098-a17b-54a806b33cbb",
+      "name": "Format Workflow Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "731ca5d5-fd99-41d8-a4bf-0b867004d20a",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        700
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## DMARC RUA XML Report Parser\n**Repo:** n8n-outbound-dns-dmarc-rua-xml-report-parser\n\nIMAP inbox -> unzip/gunzip -> safety gates -> XML -> per-IP SPF/DKIM alignment -> spoofing classification -> health score -> dashboard + alerts.\n\n**Before activating**\n1. Bind the IMAP + Header Auth credentials (placeholders in this export).\n2. Set the env vars from `.env.example` and `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`.\n3. Settings -> Error Workflow -> select **this** workflow.\n4. Run **Manual Trigger: Sandbox Test** with `SANDBOX_MODE=true`.\n\nFull text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.",
+        "height": 360,
+        "width": 760,
+        "color": 7
+      },
+      "id": "8b22962e-2bc9-4c97-ad4d-c3b9530d45b2",
+      "name": "Note: Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -460
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Ingestion & safety gates\nOne item per attachment. zip/gz are decompressed; size cap, DOCTYPE/ENTITY rejection and `<feedback>` root check run before any XML parsing.",
+        "height": 560,
+        "width": 900,
+        "color": 5
+      },
+      "id": "bed20bbc-8f06-4a49-ac81-afc48802c72e",
+      "name": "Note: Ingestion",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Analysis\nAlignment rates per source IP, allowlist (CIDR, IPv4/IPv6) matching, spoofing detection, health score, recommendations. Every failure becomes a `parse_failure` event.",
+        "height": 560,
+        "width": 480,
+        "color": 4
+      },
+      "id": "3baffc4f-85c1-4653-a485-70042a25afa6",
+      "name": "Note: Analysis",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1400,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Delivery\n`SANDBOX_MODE=true` stops at the preview node. Live: dedupe by `report_key`, POST every event to the dashboard webhook (3 retries, failure -> alert) and send alerts for spoofing, critical health, parse and delivery failures.",
+        "height": 700,
+        "width": 1400,
+        "color": 6
+      },
+      "id": "e53cc2d1-f896-479d-a3b8-7427043e3a20",
+      "name": "Note: Delivery",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 4. Workflow-level errors\nFires only when this workflow is selected as its own Error Workflow. Uses `ERROR_ALERT_WEBHOOK_URL`, falling back to `ALERT_WEBHOOK_URL`. Silent in sandbox mode.",
+        "height": 260,
+        "width": 760,
+        "color": 3
+      },
+      "id": "af89692f-39d3-44a8-ac5d-6bb97b1d4e18",
+      "name": "Note: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        600
+      ]
+    }
+  ],
+  "connections": {
+    "IMAP: DMARC RUA Inbox": {
+      "main": [
+        [
+          {
+            "node": "Split Report Attachments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Report Attachments": {
+      "main": [
+        [
+          {
+            "node": "Compressed Attachment?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compressed Attachment?": {
+      "main": [
+        [
+          {
+            "node": "Decompress (zip / gzip)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract & Validate XML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decompress (zip / gzip)": {
+      "main": [
+        [
+          {
+            "node": "Extract & Validate XML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Parse-Failure Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Validate XML": {
+      "main": [
+        [
+          {
+            "node": "XML Extracted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger: Sandbox Test": {
+      "main": [
+        [
+          {
+            "node": "Load Synthetic Sample Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Synthetic Sample Report": {
+      "main": [
+        [
+          {
+            "node": "XML Extracted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "XML Extracted?": {
+      "main": [
+        [
+          {
+            "node": "Parse DMARC XML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Parse-Failure Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse DMARC XML": {
+      "main": [
+        [
+          {
+            "node": "Compute Alignment & Detect Spoofing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Parse-Failure Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Alignment & Detect Spoofing": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Parse-Failure Event": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Preview (No Delivery)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip Already-Processed Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Already-Processed Reports": {
+      "main": [
+        [
+          {
+            "node": "Log to Dashboard Webhook",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Alert Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Dashboard Webhook": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Dashboard Delivery Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dashboard Delivery Failure": {
+      "main": [
+        [
+          {
+            "node": "Format Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Required?": {
+      "main": [
+        [
+          {
+            "node": "Format Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Format Alert Message": {
+      "main": [
+        [
+          {
+            "node": "Send Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Format Workflow Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveExecutionProgress": false,
+    "timezone": "UTC",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "repository": "n8n-outbound-dns-dmarc-rua-xml-report-parser",
+    "license": "Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer."
+  },
+  "tags": []
+}
