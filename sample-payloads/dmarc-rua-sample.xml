@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  n8n-outbound-dns-dmarc-rua-xml-report-parser :: synthetic DMARC aggregate (rua) report fixture
+  Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.
+
+  100% SYNTHETIC. Every domain uses the reserved example.com / example.net / example.org names (RFC 2606),
+  and every IP address sits in a documentation range (RFC 5737: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24;
+  RFC 3849: 2001:db8::/32). No real reporter, sender, recipient or infrastructure is represented.
+
+  Scenario covered (with AUTHORIZED_SENDER_IPS=192.0.2.0/27,192.0.2.40,2001:db8:10::/48, SPOOF_MIN_MESSAGES=5):
+    192.0.2.10      authorized_aligned          primary outbound MTA, DKIM + SPF aligned
+    192.0.2.25      authorized_aligned          ESP: DKIM aligned, SPF aligned to ESP bounce domain only (still DMARC pass)
+    2001:db8:10::5  authorized_aligned          IPv6 MTA matched by CIDR
+    192.0.2.40      authorized_misaligned       authorized app server with broken DKIM and SPF (warning)
+    203.0.113.50    unlisted_aligned_sender     passes DMARC but is not on the allowlist (info: review / add)
+    198.51.100.150  probable_forwarder          DMARC fail, reporter supplied override reason "forwarded"
+    203.0.113.200   unauthorized_low_volume     DMARC fail, below SPOOF_MIN_MESSAGES (warning)
+    198.51.100.77   unauthorized_spoofing       DMARC fail, unlisted, 45 messages (critical, triggers alert)
+-->
+<feedback>
+  <version>1.0</version>
+  <report_metadata>
+    <org_name>Example Mailbox Provider</org_name>
+    <email>noreply-dmarc-support@example.org</email>
+    <extra_contact_info>https://postmaster.example.org/dmarc</extra_contact_info>
+    <report_id>synthetic-rua-20261116-0001</report_id>
+    <date_range>
+      <begin>1794787200</begin>
+      <end>1794873599</end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    <adkim>r</adkim>
+    <aspf>r</aspf>
+    <p>none</p>
+    <sp>none</sp>
+    <pct>100</pct>
+    <fo>1</fo>
+  </policy_published>
+
+  <record>
+    <row>
+      <source_ip>192.0.2.10</source_ip>
+      <count>1200</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>example.com</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>s2026</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>example.com</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>192.0.2.25</source_ip>
+      <count>340</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>bounces.esp.example.net</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>esp1</selector>
+        <result>pass</result>
+      </dkim>
+      <dkim>
+        <domain>esp.example.net</domain>
+        <selector>shared</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>bounces.esp.example.net</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>2001:db8:10::5</source_ip>
+      <count>85</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>example.com</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>s2026</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>example.com</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>192.0.2.40</source_ip>
+      <count>20</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>fail</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>app.example.com</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>legacy</selector>
+        <result>fail</result>
+      </dkim>
+      <spf>
+        <domain>app.example.com</domain>
+        <scope>mfrom</scope>
+        <result>softfail</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>203.0.113.50</source_ip>
+      <count>60</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>mail.crm.example.net</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>crm1</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>mail.crm.example.net</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>198.51.100.150</source_ip>
+      <count>12</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>fail</dkim>
+        <spf>fail</spf>
+        <reason>
+          <type>forwarded</type>
+          <comment>synthetic: message relayed by a mailing list host</comment>
+        </reason>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>lists.example.net</envelope_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>example.com</domain>
+        <selector>s2026</selector>
+        <result>fail</result>
+      </dkim>
+      <spf>
+        <domain>lists.example.net</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>203.0.113.200</source_ip>
+      <count>3</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>fail</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>unknown-host.example.net</envelope_from>
+    </identifiers>
+    <auth_results>
+      <spf>
+        <domain>unknown-host.example.net</domain>
+        <scope>mfrom</scope>
+        <result>none</result>
+      </spf>
+    </auth_results>
+  </record>
+
+  <record>
+    <row>
+      <source_ip>198.51.100.77</source_ip>
+      <count>45</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>fail</dkim>
+        <spf>fail</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>example.com</header_from>
+      <envelope_from>spoof-relay.example.net</envelope_from>
+    </identifiers>
+    <auth_results>
+      <spf>
+        <domain>spoof-relay.example.net</domain>
+        <scope>mfrom</scope>
+        <result>fail</result>
+      </spf>
+    </auth_results>
+  </record>
+</feedback>
