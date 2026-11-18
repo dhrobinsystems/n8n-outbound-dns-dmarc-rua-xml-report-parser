@@ -56,6 +56,8 @@ Outbound programs (cold email, lifecycle, transactional) live and die on domain 
 
 ## Architecture
 
+![DMARC RUA XML Report Parser Workflow](workflow-overview.png)
+
 ```mermaid
 flowchart LR
     subgraph Ingest
